@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -57,6 +58,8 @@ type BOSStorageConfig struct {
 	// StsTokenRefreshPeriod Time to refresh StsToken,If StsTokenPath is empty, this value is invalid
 	// If StsTokenPath is file path, this value is invalid StsToken will be refreshed every time when the file is modified
 	StsTokenRefreshPeriod time.Duration `yaml:"sts_token_refresh_period,omitempty"`
+
+	PathPrefix string `yaml:"path_prefix"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -72,6 +75,7 @@ func (cfg *BOSStorageConfig) RegisterFlagsWithPrefix(prefix string, f *flag.Flag
 	f.Var(&cfg.SecretAccessKey, prefix+"baidubce.secret-access-key", "Baidu Cloud Engine (BCE) Secret Access Key.")
 	f.StringVar(&cfg.StsTokenPath, prefix+"baidubce.sts-token-path", "", "Must be an HTTP address(must start with `http://` prefix) or file address where authentication can be obtained.")
 	f.DurationVar(&cfg.StsTokenRefreshPeriod, prefix+"baidubce.sts-token-refresh-period", DefaultStsTokenRefreshPeriod, "Time to refresh STS token.")
+	f.StringVar(&cfg.PathPrefix, prefix+"baidubce.path-prefix", "", "BOS write prefix")
 }
 
 type SessionToken struct {
@@ -240,6 +244,7 @@ func (b *BOSObjectStorage) PutObject(ctx context.Context, objectKey string, obje
 		if err != nil {
 			return err
 		}
+		objectKey := fmt.Sprintf("%s/%s", b.cfg.PathPrefix, objectKey)
 		_, err = b.client.BasicPutObject(b.cfg.BucketName, objectKey, body)
 		return err
 	})
@@ -249,6 +254,7 @@ func (b *BOSObjectStorage) GetObject(ctx context.Context, objectKey string) (io.
 	var res *api.GetObjectResult
 	err := instrument.CollectedRequest(ctx, "BOS.GetObject", bosRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		var requestErr error
+		objectKey := fmt.Sprintf("%s/%s", b.cfg.PathPrefix, objectKey)
 		res, requestErr = b.client.BasicGetObject(b.cfg.BucketName, objectKey)
 		return requestErr
 	})
@@ -265,6 +271,7 @@ func (b *BOSObjectStorage) List(ctx context.Context, prefix string, delimiter st
 
 	err := instrument.CollectedRequest(ctx, "BOS.List", bosRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		args := new(api.ListObjectsArgs)
+		prefix := fmt.Sprintf("%s/%s", b.cfg.PathPrefix, prefix)
 		args.Prefix = prefix
 		args.Delimiter = delimiter
 		for {
@@ -302,6 +309,7 @@ func (b *BOSObjectStorage) List(ctx context.Context, prefix string, delimiter st
 
 func (b *BOSObjectStorage) DeleteObject(ctx context.Context, objectKey string) error {
 	return instrument.CollectedRequest(ctx, "BOS.DeleteObject", bosRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+		objectKey := fmt.Sprintf("%s/%s", b.cfg.PathPrefix, objectKey)
 		err := b.client.DeleteObject(b.cfg.BucketName, objectKey)
 		return err
 	})
