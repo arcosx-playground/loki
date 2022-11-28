@@ -2,11 +2,17 @@ package baidubce
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"strings"
 
 	"io"
 	"time"
 
+	"github.com/baidubce/bce-sdk-go/auth"
 	"github.com/baidubce/bce-sdk-go/bce"
 	"github.com/baidubce/bce-sdk-go/services/bos"
 	"github.com/baidubce/bce-sdk-go/services/bos/api"
@@ -14,6 +20,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weaveworks/common/instrument"
+	"gopkg.in/fsnotify.v1"
 
 	"github.com/grafana/loki/pkg/storage/chunk/client"
 )
@@ -25,6 +32,8 @@ import (
 const NoSuchKeyErr = "NoSuchKey"
 
 const DefaultEndpoint = bos.DEFAULT_SERVICE_DOMAIN
+
+const DefaultStsTokenRefreshPeriod = 5 * time.Minute
 
 var bosRequestDuration = instrument.NewHistogramCollector(prometheus.NewHistogramVec(prometheus.HistogramOpts{
 	Namespace: "loki",
@@ -42,6 +51,12 @@ type BOSStorageConfig struct {
 	Endpoint        string         `yaml:"endpoint"`
 	AccessKeyID     string         `yaml:"access_key_id"`
 	SecretAccessKey flagext.Secret `yaml:"secret_access_key"`
+
+	// StsTokenPath Once this is enabled, AccessKeyID SecretAccessKey will be an invalid value
+	StsTokenPath string `yaml:"sts_token_path,omitempty"`
+	// StsTokenRefreshPeriod Time to refresh StsToken,If StsTokenPath is empty, this value is invalid
+	// If StsTokenPath is file path, this value is invalid StsToken will be refreshed every time when the file is modified
+	StsTokenRefreshPeriod time.Duration `yaml:"sts_token_refresh_period,omitempty"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -55,6 +70,133 @@ func (cfg *BOSStorageConfig) RegisterFlagsWithPrefix(prefix string, f *flag.Flag
 	f.StringVar(&cfg.Endpoint, prefix+"baidubce.endpoint", DefaultEndpoint, "BOS endpoint to connect to.")
 	f.StringVar(&cfg.AccessKeyID, prefix+"baidubce.access-key-id", "", "Baidu Cloud Engine (BCE) Access Key ID.")
 	f.Var(&cfg.SecretAccessKey, prefix+"baidubce.secret-access-key", "Baidu Cloud Engine (BCE) Secret Access Key.")
+	f.StringVar(&cfg.StsTokenPath, prefix+"baidubce.sts-token-path", "", "Must be an HTTP address(must start with `http://` prefix) or file address where authentication can be obtained.")
+	f.DurationVar(&cfg.StsTokenRefreshPeriod, prefix+"baidubce.sts-token-refresh-period", DefaultStsTokenRefreshPeriod, "Time to refresh STS token.")
+}
+
+type SessionToken struct {
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+	SessionToken    string `json:"session_token"`
+	CreateTime      string `json:"create_time,omitempty"`
+	Expiration      string `json:"expiration,omitempty"`
+	UserID          string `json:"user_id,omitempty"`
+}
+
+func (b *BOSObjectStorage) startStsTokenReFresh() {
+	if strings.HasPrefix(b.cfg.StsTokenPath, "http://") {
+		timeTicker := time.NewTicker(b.cfg.StsTokenRefreshPeriod)
+		for {
+			err := b.refreshStsClient()
+			if err != nil {
+				continue
+			}
+			<-timeTicker.C
+		}
+	}
+	// If StsTokenPath is file path
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op == fsnotify.Remove {
+					watcher.Remove(event.Name)
+					watcher.Add(b.cfg.StsTokenPath)
+					err := b.refreshStsClient()
+					if err != nil {
+						continue
+					}
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					err := b.refreshStsClient()
+					if err != nil {
+						continue
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("error:", err)
+			}
+		}
+	}()
+
+	err = watcher.Add(b.cfg.StsTokenPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	<-done
+}
+
+func (b *BOSObjectStorage) refreshStsClient() error {
+	return instrument.CollectedRequest(context.Background(), "BOS.refreshStsClient", bosRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+		sts, err := getSts(b.cfg.StsTokenPath)
+		if err != nil {
+			return err
+		}
+		stsBOSClient, err := buildStsBOSClient(sts, b.cfg.Endpoint)
+		if err != nil {
+			return err
+		}
+		b.client = stsBOSClient
+		return nil
+	})
+}
+
+func buildStsBOSClient(sts SessionToken, endPoint string) (*bos.Client, error) {
+	bosClient, err := bos.NewClient(sts.AccessKeyID, sts.SecretAccessKey, endPoint)
+	if err != nil {
+		return nil, err
+	}
+	stsCredential, err := auth.NewSessionBceCredentials(
+		sts.AccessKeyID,
+		sts.SecretAccessKey,
+		sts.SessionToken)
+	if err != nil {
+		return nil, err
+	}
+	bosClient.Config.Credentials = stsCredential
+	return bosClient, nil
+}
+
+func getSts(stsTokenPath string) (SessionToken, error) {
+	if strings.HasPrefix(stsTokenPath, "http://") {
+		resp, err := http.Get(stsTokenPath)
+		if err != nil {
+			return SessionToken{}, err
+		}
+		defer resp.Body.Close()
+		body, _ := ioutil.ReadAll(resp.Body)
+		var sessionToken SessionToken
+		err = json.Unmarshal(body, &sessionToken)
+		if err != nil {
+			return SessionToken{}, err
+		}
+		return sessionToken, nil
+	}
+	// If StsTokenPath is file path
+	body, err := ioutil.ReadFile(stsTokenPath)
+	if err != nil {
+		return SessionToken{}, err
+	}
+	var sessionToken SessionToken
+	err = json.Unmarshal(body, &sessionToken)
+	if err != nil {
+		return SessionToken{}, err
+	}
+	return sessionToken, nil
 }
 
 type BOSObjectStorage struct {
@@ -63,20 +205,33 @@ type BOSObjectStorage struct {
 }
 
 func NewBOSObjectStorage(cfg *BOSStorageConfig) (*BOSObjectStorage, error) {
-	clientConfig := bos.BosClientConfiguration{
-		Ak:               cfg.AccessKeyID,
-		Sk:               cfg.SecretAccessKey.String(),
-		Endpoint:         cfg.Endpoint,
-		RedirectDisabled: false,
+	if cfg.StsTokenPath == "" {
+		clientConfig := bos.BosClientConfiguration{
+			Ak:               cfg.AccessKeyID,
+			Sk:               cfg.SecretAccessKey.String(),
+			Endpoint:         cfg.Endpoint,
+			RedirectDisabled: false,
+		}
+		bosClient, err := bos.NewClientWithConfig(&clientConfig)
+		if err != nil {
+			return nil, err
+		}
+		return &BOSObjectStorage{
+			cfg:    cfg,
+			client: bosClient,
+		}, nil
 	}
-	bosClient, err := bos.NewClientWithConfig(&clientConfig)
+	bosObjectStorage := &BOSObjectStorage{
+		cfg: cfg,
+	}
+	// when first created check the current Sts
+	err := bosObjectStorage.refreshStsClient()
 	if err != nil {
 		return nil, err
 	}
-	return &BOSObjectStorage{
-		cfg:    cfg,
-		client: bosClient,
-	}, nil
+	// start a goroutine to refresh the Sts
+	go bosObjectStorage.startStsTokenReFresh()
+	return bosObjectStorage, nil
 }
 
 func (b *BOSObjectStorage) PutObject(ctx context.Context, objectKey string, object io.ReadSeeker) error {
